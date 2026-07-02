@@ -730,7 +730,7 @@ with tab1:
                     
                     # Download video using pytubefix (same as your working script)
                     input_video = os.path.join(temp_dir, "input_video.mp4")
-                    success, result = download_video_pytubefix(video_url, input_video)
+                    success, result = download_video_ytdlp(video_url, temp_dir)
                     
                     if not success:
                         st.error(f"Download failed: {result}")

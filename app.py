@@ -6,7 +6,7 @@ import ast
 import tempfile
 import streamlit as st
 import requests
-from moviepy.editor import VideoFileClip, concatenate_videoclips
+from moviepy import VideoFileClip, concatenate_videoclips
 import whisper
 from pytubefix import YouTube
 from pathlib import Path

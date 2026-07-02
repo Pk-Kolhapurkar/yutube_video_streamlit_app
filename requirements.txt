@@ -3,3 +3,6 @@ moviepy
 openai-whisper 
 pytubefix>=2.0.0
 requests
+beautifulsoup4 
+whisper 
+Pillow

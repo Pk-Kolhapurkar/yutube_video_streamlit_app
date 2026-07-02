@@ -94,30 +94,44 @@ def load_whisper_model(model_name="base"):
         return whisper.load_model(model_name)
 
 def download_video(url, output_path):
-    """Download video from YouTube or direct URL"""
-    try:
-        # Try YouTube download
-        yt = YouTube(url)
-        video = yt.streams.filter(progressive=True, file_extension='mp4').first()
-        if video:
-            video.download(output_path=output_path, filename="input_video.mp4")
-            return os.path.join(output_path, "input_video.mp4")
-    except:
-        pass
+    """Download video from YouTube or direct URL with validation"""
+    video_path = os.path.join(output_path, "input_video.mp4")
     
-    # Try direct download for other URLs
+    # 1. Try YouTube Download
+    if "youtube.com" in url or "youtu.be" in url:
+        try:
+            yt = YouTube(url)
+            # get_highest_resolution() is more reliable than progressive=True filters
+            video = yt.streams.get_highest_resolution()
+            if video:
+                video.download(output_path=output_path, filename="input_video.mp4")
+                
+                # CRITICAL VALIDATION: Check if the file actually has data
+                if os.path.exists(video_path) and os.path.getsize(video_path) > 1000:
+                    return video_path
+                else:
+                    st.warning("YouTube download resulted in an empty file. Trying fallback direct download...")
+        except Exception as e:
+            st.warning(f"YouTube downloader failed: {str(e)}. Trying fallback direct download...")
+
+    # 2. Try Direct Download (or fallback if YouTube scraped a dead link)
     try:
-        response = requests.get(url, stream=True)
+        # Use a real User-Agent so hosting servers don't block Streamlit
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+        response = requests.get(url, stream=True, headers=headers, timeout=30)
+        
         if response.status_code == 200:
-            video_path = os.path.join(output_path, "input_video.mp4")
             with open(video_path, 'wb') as f:
                 for chunk in response.iter_content(chunk_size=8192):
-                    f.write(chunk)
-            return video_path
-    except:
+                    if chunk:
+                        f.write(chunk)
+            
+            if os.path.exists(video_path) and os.path.getsize(video_path) > 1000:
+                return video_path
+    except Exception as e:
         pass
-    
-    raise ValueError("Could not download video. Please check the URL and try again.")
+        
+    raise ValueError("Could not download a valid video. Please verify the URL, or ensure the YouTube video is public and not age-restricted.")
 
 def transcribe_video(video_path, model):
     with st.spinner("Transcribing video... This may take a while..."):

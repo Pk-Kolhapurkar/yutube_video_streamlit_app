@@ -7,7 +7,7 @@ import tempfile
 import streamlit as st
 import requests
 from bs4 import BeautifulSoup
-from moviepy import VideoFileClip, concatenate_videoclips
+from moviepy.editor import VideoFileClip, concatenate_videoclips
 from pytubefix import YouTube
 from pytubefix.cli import on_progress
 import whisper
@@ -171,8 +171,8 @@ def is_valid_youtube_url(url):
             return True
     return False
 
-def download_video_pytubefix(youtube_url, output_filename='input_video.mp4', quality='highest'):
-    """Download a YouTube video using pytubefix."""
+def download_video_pytubefix(youtube_url, output_filename='input_video.mp4'):
+    """Download a YouTube video using pytubefix - WORKS!"""
     try:
         cleaned_url = clean_youtube_url(youtube_url)
         
@@ -199,35 +199,23 @@ def download_video_pytubefix(youtube_url, output_filename='input_video.mp4', qua
         st.session_state.video_title = video_title
         status_text.text(f"📹 Found: {video_title}")
         
-        # Select stream based on quality
-        if quality == 'audio_only':
-            stream = yt.streams.get_audio_only()
-            if not stream:
-                return False, "No audio stream available"
-        elif quality == 'lowest':
-            stream = yt.streams.get_lowest_resolution()
-            if not stream:
-                stream = yt.streams.first()
-        else:  # highest
-            stream = yt.streams.get_highest_resolution()
-            if not stream:
-                stream = yt.streams.first()
+        # Get the highest resolution stream (same as your working script)
+        video_download = yt.streams.get_highest_resolution()
         
-        if not stream:
-            return False, "No suitable stream found"
+        if not video_download:
+            return False, "No video stream available"
         
         # Download the video
         status_text.text(f"⬇️ Downloading: {video_title}")
-        video_path = stream.download(output_path=os.path.dirname(output_filename), 
-                                    filename=os.path.basename(output_filename))
+        
+        # Use the same approach as your working script
+        video_path = video_download.download(
+            output_path=os.path.dirname(output_filename),
+            filename=os.path.basename(output_filename)
+        )
         
         progress_bar.progress(1.0)
         status_text.text("✅ Download complete!")
-        
-        # If it's an audio-only download, convert to mp4 container for compatibility
-        if quality == 'audio_only' and video_path.endswith('.mp4'):
-            # Audio-only downloads from pytubefix are usually in mp4 container
-            pass
         
         return True, video_path
         
@@ -742,13 +730,9 @@ with tab1:
                 with tempfile.TemporaryDirectory() as temp_dir:
                     status_placeholder.info("📥 Downloading video with pytubefix...")
                     
-                    # Download video using pytubefix
+                    # Download video using pytubefix (same as your working script)
                     input_video = os.path.join(temp_dir, "input_video.mp4")
-                    success, result = download_video_pytubefix(
-                        video_url, 
-                        input_video,
-                        quality=download_quality
-                    )
+                    success, result = download_video_pytubefix(video_url, input_video)
                     
                     if not success:
                         st.error(f"Download failed: {result}")

@@ -6,14 +6,24 @@ import ast
 import tempfile
 import streamlit as st
 import requests
-from moviepy import VideoFileClip, concatenate_videoclips
+from bs4 import BeautifulSoup
+from moviepy.editor import VideoFileClip, concatenate_videoclips
 import whisper
-from pytubefix import YouTube
-from pathlib import Path
 
-# Set page config
+# ---- Compatibility shim for moviepy/Pillow ----
+from PIL import Image
+if not hasattr(Image, 'ANTIALIAS'):
+    Image.ANTIALIAS = Image.LANCZOS
+
+# ==================== HARDCODED CONFIGURATION ====================
+# WARNING: These are hardcoded for testing. Rotate/revoke before sharing.
+APIFY_API_TOKEN = "apify_api_ddMBOcNe4LMijVOsErHSJDfvgUMlfE1Pi3LQ"
+APIFY_ACTOR_ID = "streamers~youtube-video-downloader"
+GROQ_API_KEY = "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"
+
+# ==================== PAGE CONFIG ====================
 st.set_page_config(
-    page_title="AI Video Editor",
+    page_title="YouTube Shorts Creator 🎬",
     page_icon="🎬",
     layout="wide"
 )
@@ -25,19 +35,339 @@ if 'transcript' not in st.session_state:
     st.session_state.transcript = None
 if 'segments' not in st.session_state:
     st.session_state.segments = None
+if 'shorts_created' not in st.session_state:
+    st.session_state.shorts_created = []
+if 'video_title' not in st.session_state:
+    st.session_state.video_title = ""
+if 'trending_videos' not in st.session_state:
+    st.session_state.trending_videos = []
 
-# Custom CSS for background image
-st.markdown(f"""
-    <style>
-    .stApp {{
-        background-image: url("https://images.unsplash.com/photo-1516557070061-c3d1653fa646?ixlib=rb-4.0.3&ixid=MnwxMjA3fDB8MHxwaG90by1wYWdlfHx8fGVufDB8fHx8&auto=format&fit=crop&w=2070&q=80"); 
-        background-attachment: fixed;
-        background-size: cover;
-    }}
-    </style>
-    """, unsafe_allow_html=True)
+# ==================== VIDEO DOWNLOAD FUNCTIONS ====================
 
-# Helper functions
+def clean_youtube_url(url):
+    """Clean and validate YouTube URL."""
+    url = url.strip()
+    
+    patterns = [
+        r'(?:youtube\.com\/watch\?v=)([\w-]+)',
+        r'(?:youtu\.be\/)([\w-]+)',
+        r'(?:youtube\.com\/embed\/)([\w-]+)',
+        r'(?:youtube\.com\/v\/)([\w-]+)',
+        r'(?:youtube\.com\/shorts\/)([\w-]+)'
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, url)
+        if match:
+            video_id = match.group(1)
+            return f"https://www.youtube.com/watch?v={video_id}"
+    
+    return url
+
+def extract_video_id(url):
+    """Extract video ID from a YouTube URL."""
+    patterns = [
+        r'v=([\w-]+)',
+        r'youtu\.be/([\w-]+)',
+        r'embed/([\w-]+)',
+        r'shorts/([\w-]+)'
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, url)
+        if match:
+            return match.group(1)
+    return None
+
+def is_valid_youtube_url(url):
+    """Check if a URL is a valid YouTube URL."""
+    patterns = [
+        r'^https?://(?:www\.)?youtube\.com/watch\?v=[\w-]+',
+        r'^https?://(?:www\.)?youtu\.be/[\w-]+',
+        r'^https?://(?:www\.)?youtube\.com/embed/[\w-]+',
+        r'^https?://(?:www\.)?youtube\.com/shorts/[\w-]+'
+    ]
+    
+    for pattern in patterns:
+        if re.match(pattern, url):
+            return True
+    return False
+
+def get_top_videos():
+    """Scrape top 10 most viewed videos from Kworb.net."""
+    url = 'https://kworb.net/youtube/'
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+    }
+    
+    try:
+        response = requests.get(url, headers=headers, timeout=10)
+        response.raise_for_status()
+        
+        soup = BeautifulSoup(response.content, 'html.parser')
+        table = soup.find('table', id='youtuberealtime')
+        
+        if not table:
+            return []
+        
+        rows = table.find('tbody').find_all('tr')
+        top_videos = []
+        
+        for row in rows[:10]:
+            cols = row.find_all('td')
+            if len(cols) < 5:
+                continue
+                
+            rank = cols[0].get_text(strip=True)
+            video_cell = cols[2]
+            kworb_link_tag = video_cell.find('a')
+            
+            if not kworb_link_tag:
+                continue
+                
+            kworb_link = kworb_link_tag['href']
+            video_title = kworb_link_tag.get_text(strip=True)
+            
+            video_id = kworb_link.split('/')[-1].replace('.html', '')
+            youtube_url = f'https://www.youtube.com/watch?v={video_id}'
+            
+            views = cols[3].get_text(strip=True)
+            likes = cols[4].get_text(strip=True)
+            
+            top_videos.append({
+                'rank': rank,
+                'title': video_title,
+                'video_id': video_id,
+                'youtube_url': youtube_url,
+                'views': views,
+                'likes': likes
+            })
+        
+        return top_videos
+        
+    except Exception as e:
+        st.error(f"Error fetching top videos: {e}")
+        return []
+
+def _find_best_video_url(video_data):
+    """Find the best video URL from Apify response."""
+    # Prefer Apify-hosted stable copies
+    stable_fields = ['downloadedFileUrl', 'fileUrl']
+    for field in stable_fields:
+        value = video_data.get(field)
+        if isinstance(value, str) and value.startswith('http'):
+            return value, True
+    
+    # Fall back to signed URLs
+    priority_fields = [
+        'muxedUrl', 'combinedUrl', 'videoUrl', 'hdUrl', 'sdUrl',
+        'downloadUrl', 'url', 'download', 'link', 'videoOnlyUrl'
+    ]
+    for field in priority_fields:
+        value = video_data.get(field)
+        if isinstance(value, str) and value.startswith('http'):
+            return value, False
+    
+    # Check nested structures
+    for key in ('video', 'file', 'result', 'formats'):
+        nested = video_data.get(key)
+        if isinstance(nested, dict):
+            for sub_field in ('url', 'downloadUrl', 'muxedUrl'):
+                if nested.get(sub_field):
+                    return nested[sub_field], False
+        elif isinstance(nested, list) and nested:
+            first = nested[0]
+            if isinstance(first, dict):
+                for sub_field in ('url', 'downloadUrl'):
+                    if first.get(sub_field):
+                        return first[sub_field], False
+    
+    return None, False
+
+def download_video_apify(youtube_url, output_filename='input_video.mp4'):
+    """Download a YouTube video using Apify's API."""
+    try:
+        cleaned_url = clean_youtube_url(youtube_url)
+        
+        if not is_valid_youtube_url(cleaned_url):
+            return False, f"Invalid YouTube URL: {cleaned_url}"
+        
+        video_id = extract_video_id(cleaned_url)
+        
+        input_data = {"videos": [{"url": cleaned_url}]}
+        
+        api_base = "https://api.apify.com/v2"
+        headers = {
+            'Authorization': f'Bearer {APIFY_API_TOKEN}',
+            'Content-Type': 'application/json'
+        }
+        
+        start_url = f"{api_base}/actors/{APIFY_ACTOR_ID}/runs"
+        response = requests.post(start_url, json=input_data, headers=headers)
+        
+        if response.status_code != 201:
+            error_detail = response.text[:500]
+            return False, f"Failed to start actor (status {response.status_code}): {error_detail}"
+        
+        run_data = response.json()
+        run_id = run_data['data']['id']
+        
+        # Wait for completion
+        max_attempts = 120
+        attempts = 0
+        status_data = None
+        
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        
+        while attempts < max_attempts:
+            status_url = f"{api_base}/actor-runs/{run_id}"
+            status_response = requests.get(status_url, headers=headers)
+            
+            if status_response.status_code != 200:
+                time.sleep(5)
+                attempts += 1
+                continue
+            
+            status_data = status_response.json()
+            current_status = status_data['data']['status']
+            
+            # Update progress
+            progress = min(attempts / max_attempts, 0.9)
+            progress_bar.progress(progress)
+            status_text.text(f"Downloading video... Status: {current_status}")
+            
+            if current_status == 'SUCCEEDED':
+                break
+            elif current_status in ['FAILED', 'ABORTED', 'TIMED-OUT']:
+                return False, f"Actor run {current_status}"
+            
+            attempts += 1
+            time.sleep(5)
+        
+        progress_bar.progress(1.0)
+        status_text.text("Download complete! Processing results...")
+        
+        if attempts >= max_attempts:
+            return False, "Actor run timed out after 10 minutes"
+        
+        # Get results
+        dataset_id = status_data['data']['defaultDatasetId']
+        results_url = f"{api_base}/datasets/{dataset_id}/items"
+        results_response = requests.get(results_url, headers=headers)
+        
+        if results_response.status_code != 200:
+            return False, f"Failed to get results: {results_response.text[:200]}"
+        
+        results = results_response.json()
+        
+        if not results:
+            # Try key-value store
+            store_id = status_data['data']['defaultKeyValueStoreId']
+            store_url = f"{api_base}/key-value-stores/{store_id}/records"
+            store_response = requests.get(store_url, headers=headers)
+            
+            if store_response.status_code == 200:
+                store_data = store_response.json()
+                for key, value in store_data.items():
+                    if key.endswith(('.mp4', '.webm', '.mkv')):
+                        download_url = f"{api_base}/key-value-stores/{store_id}/records/{key}"
+                        return download_file_from_url(download_url, output_filename)
+            
+            return False, "No results returned from actor"
+        
+        video_data = results[0]
+        download_url, needs_apify_auth = _find_best_video_url(video_data)
+        
+        if not download_url:
+            # Try key-value store as fallback
+            store_id = status_data['data']['defaultKeyValueStoreId']
+            store_url = f"{api_base}/key-value-stores/{store_id}/records"
+            store_response = requests.get(store_url, headers=headers)
+            
+            if store_response.status_code == 200:
+                store_data = store_response.json()
+                for key, value in store_data.items():
+                    if key.endswith(('.mp4', '.webm', '.mkv')):
+                        download_url = f"{api_base}/key-value-stores/{store_id}/records/{key}?attachment=true"
+                        needs_apify_auth = True
+                        break
+            
+            if not download_url:
+                return False, f"No download URL found. Available fields: {list(video_data.keys())}"
+        
+        auth_header = {'Authorization': f'Bearer {APIFY_API_TOKEN}'} if needs_apify_auth else None
+        return download_file_from_url(download_url, output_filename, extra_headers=auth_header)
+        
+    except Exception as e:
+        return False, f"Error: {str(e)}"
+
+def download_file_from_url(download_url, output_filename, extra_headers=None):
+    """Download a file from URL with progress tracking."""
+    try:
+        download_headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Accept': 'video/webm,video/ogg,video/*;q=0.9,*/*;q=0.8',
+        }
+        if extra_headers:
+            download_headers.update(extra_headers)
+        
+        file_response = requests.get(download_url, stream=True, headers=download_headers, allow_redirects=True)
+        file_response.raise_for_status()
+        
+        total_size = int(file_response.headers.get('content-length', 0))
+        
+        with open(output_filename, 'wb') as f:
+            downloaded = 0
+            for chunk in file_response.iter_content(chunk_size=8192):
+                if chunk:
+                    f.write(chunk)
+                    downloaded += len(chunk)
+        
+        return True, output_filename
+        
+    except Exception as e:
+        return False, f"Download error: {str(e)}"
+
+def download_video(youtube_url, output_filename='input_video.mp4'):
+    """Main download function."""
+    return download_video_apify(youtube_url, output_filename)
+
+# ==================== TRANSCRIPTION ====================
+
+@st.cache_resource
+def load_whisper_model(model_name="base"):
+    with st.spinner(f"Loading Whisper {model_name} model..."):
+        return whisper.load_model(model_name)
+
+def transcribe_video(video_path, model_name="base"):
+    with st.spinner("Transcribing video... This may take a while..."):
+        model = load_whisper_model(model_name)
+        
+        # Extract audio using moviepy
+        video = VideoFileClip(video_path)
+        audio_path = os.path.join(os.path.dirname(video_path), "temp_audio.wav")
+        video.audio.write_audiofile(audio_path, verbose=False, logger=None)
+        video.close()
+        
+        # Transcribe
+        result = model.transcribe(audio_path)
+        transcription = []
+        for segment in result['segments']:
+            transcription.append({
+                'start': segment['start'],
+                'end': segment['end'],
+                'text': segment['text'].strip()
+            })
+        
+        # Clean up
+        if os.path.exists(audio_path):
+            os.remove(audio_path)
+        
+        return transcription
+
+# ==================== GROQ ANALYSIS ====================
+
 def _extract_balanced_block(text, start_index, open_char, close_char):
     depth = 0
     in_string = False
@@ -71,6 +401,7 @@ def _extract_json_payload(text):
             last_json_object = candidate
     if last_json_object:
         return last_json_object
+    
     for opener, closer in [('[', ']'), ('{', '}')]:
         for match in reversed(list(re.finditer(re.escape(opener), text))):
             try:
@@ -99,108 +430,8 @@ def _chunk_transcript(transcript, max_tokens_per_chunk=4000):
         chunks.append(current_chunk)
     return chunks
 
-@st.cache_resource
-def load_whisper_model(model_name="base"):
-    with st.spinner(f"Loading Whisper {model_name} model..."):
-        return whisper.load_model(model_name)
-
-@st.cache_data
-def get_video_info_and_streams(url):
-    """Bypasses 403 restrictions using client OAuth profiles securely"""
-    if "youtube.com" in url or "youtu.be" in url:
-        yt = YouTube(url, use_oauth=True, allow_oauth_cache=True)
-        streams = yt.streams.filter(progressive=True, type='video')
-        details = {
-            "is_youtube": True,
-            "image": yt.thumbnail_url,
-            "title": yt.title,
-            "length": yt.length,
-            "streams": streams
-        }
-        itag, resolutions, vformat, frate = ([] for _ in range(4))
-        for stream in streams:
-            res = re.search(r'(\d+)p', str(stream))
-            typ = re.search(r'video/(\w+)', str(stream))
-            fps = re.search(r'(\d+)fps', str(stream))
-            tag = re.search(r'(\d+)', str(stream))
-            
-            itag.append(str(stream)[tag.start():tag.end()] if tag else "")
-            resolutions.append(str(stream)[res.start():res.end()] if res else "Unknown")
-            vformat.append(str(stream)[typ.start():typ.end()] if typ else "video/mp4")
-            frate.append(str(stream)[fps.start():fps.end()] if fps else "30fps")
-            
-        details["resolutions"] = resolutions
-        details["itag"] = itag
-        details["fps"] = frate
-        details["format"] = vformat
-        return details
-    else:
-        # Fallback dictionary metadata signature for direct file URLs
-        return {
-            "is_youtube": False,
-            "image": "https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe",
-            "title": "Direct_Video_File",
-            "length": "Unknown",
-            "resolutions": ["Default Resolution"],
-            "itag": ["0"],
-            "fps": ["30fps"],
-            "format": ["video/mp4"]
-        }
-
-def download_video_stream(url, output_path, v_info, selected_index=0):
-    """Downloads chosen format streams securely into temporary storage"""
-    video_path = os.path.join(output_path, "input_video.mp4")
-    
-    if v_info.get("is_youtube"):
-        try:
-            chosen_itag = v_info['itag'][selected_index]
-            yt = YouTube(url, use_oauth=True, allow_oauth_cache=True)
-            ds = yt.streams.get_by_itag(chosen_itag)
-            if ds:
-                ds.download(output_path=output_path, filename="input_video.mp4")
-                if os.path.exists(video_path) and os.path.getsize(video_path) > 1000:
-                    return video_path
-        except Exception as e:
-            st.warning(f"Targeted stream download failed: {str(e)}. Trying generic stream retrieval...")
-
-    # Fallback/Direct HTTP fetch execution block
-    try:
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-        response = requests.get(url, stream=True, headers=headers, timeout=45)
-        if response.status_code == 200:
-            with open(video_path, 'wb') as f:
-                for chunk in response.iter_content(chunk_size=8192):
-                    if chunk:
-                        f.write(chunk)
-            if os.path.exists(video_path) and os.path.getsize(video_path) > 1000:
-                return video_path
-    except Exception as e:
-        pass
-        
-    raise ValueError("File stream generation failed. Ensure your link is valid and accessible.")
-
-def transcribe_video(video_path, model):
-    with st.spinner("Transcribing video... This may take a while..."):
-        video = VideoFileClip(video_path)
-        audio_path = os.path.join(os.path.dirname(video_path), "temp_audio.wav")
-        video.audio.write_audiofile(audio_path, verbose=False, logger=None)
-        video.close()
-        
-        result = model.transcribe(audio_path)
-        transcription = []
-        for segment in result['segments']:
-            transcription.append({
-                'start': segment['start'],
-                'end': segment['end'],
-                'text': segment['text'].strip()
-            })
-        
-        if os.path.exists(audio_path):
-            os.remove(audio_path)
-        return transcription
-
-def call_groq(prompt_transcript, user_query, api_key, max_retries=4):
-    prompt = f"""You are an expert video editor who can read video transcripts and perform video editing. Given a transcript with segments, your task is to identify all the conversations related to a user query. Follow these guidelines when choosing conversations. A group of continuous segments in the transcript is a conversation.
+def call_groq(prompt_transcript, user_query, max_retries=4):
+    prompt = f"""You are an expert video editor who can read video transcripts and perform video editing. Given a transcript with segments, your task is to identify all the conversations related to a user query. A group of continuous segments in the transcript is a conversation.
 
 Guidelines:
 1. The conversation should be relevant to the user query. The conversation should include more than one segment to provide context and continuity.
@@ -209,7 +440,8 @@ Guidelines:
 4. Choose multiple conversations from the transcript that are relevant to the user query.
 5. Match the start and end time of the conversations using the segment timestamps from the transcript.
 6. The conversations should be a direct part of the video and should not be out of context.
-7. This transcript may be a partial chunk of a longer video. Only use the segments given to you below — do not invent timestamps outside this range. If nothing in this chunk is relevant, return an empty list.
+7. Each segment should be ideally between 15-59 seconds long for YouTube Shorts format.
+8. This transcript may be a partial chunk of a longer video. Only use the segments given to you below — do not invent timestamps outside this range. If nothing in this chunk is relevant, return an empty list.
 
 Output format: {{ "conversations": [{{"start": "s1", "end": "e1"}}, {{"start": "s2", "end": "e2"}}] }}
 
@@ -224,7 +456,7 @@ User query:
     url = "https://api.groq.com/openai/v1/chat/completions"
     headers = {
         "Content-Type": "application/json",
-        "Authorization": f"Bearer {api_key}"
+        "Authorization": f"Bearer {GROQ_API_KEY}"
     }
     data = {
         "messages": [
@@ -242,6 +474,7 @@ User query:
 
     for attempt in range(1, max_retries + 1):
         response = requests.post(url, headers=headers, json=data)
+        
         if response.status_code == 429 or response.status_code == 413:
             wait = min(2 ** attempt, 30)
             time.sleep(wait)
@@ -254,6 +487,9 @@ User query:
         
         if response.status_code != 200:
             raise RuntimeError(f"API request failed ({response.status_code}): {response_data}")
+        
+        if not response_data.get("choices"):
+            raise RuntimeError(f"Unexpected API response structure: {response_data}")
         
         choice = response_data["choices"][0]
         message = choice.get("message") or choice
@@ -277,12 +513,15 @@ User query:
         
         if isinstance(conversations, list):
             return conversations
+        
         if not isinstance(conversations, dict) or "conversations" not in conversations:
             raise RuntimeError(f"Parsed API response does not contain conversations: {conversations}")
+        
         return conversations["conversations"]
+    
     raise RuntimeError("Exceeded max retries due to repeated rate limiting.")
 
-def get_relevant_segments(transcript, user_query, api_key, max_tokens_per_chunk=4000, delay_between_chunks=2.0):
+def get_relevant_segments(transcript, user_query, max_tokens_per_chunk=4000, delay_between_chunks=2.0):
     chunks = _chunk_transcript(transcript, max_tokens_per_chunk=max_tokens_per_chunk)
     progress_bar = st.progress(0)
     status_text = st.empty()
@@ -293,7 +532,7 @@ def get_relevant_segments(transcript, user_query, api_key, max_tokens_per_chunk=
     for i, chunk in enumerate(chunks, start=1):
         status_text.text(f"Processing chunk {i}/{total_chunks}...")
         try:
-            conversations = call_groq(chunk, user_query, api_key)
+            conversations = call_groq(chunk, user_query)
             all_conversations.extend(conversations)
         except RuntimeError as exc:
             st.warning(f"Chunk {i} failed and will be skipped: {exc}")
@@ -301,151 +540,270 @@ def get_relevant_segments(transcript, user_query, api_key, max_tokens_per_chunk=
         progress_bar.progress(i / total_chunks)
         if i < len(chunks):
             time.sleep(delay_between_chunks)
-            
+    
     status_text.empty()
     progress_bar.empty()
     return all_conversations
 
-def edit_video(original_video_path, segments, output_video_path, fade_duration=0.5):
-    with st.spinner("Editing video..."):
-        video = VideoFileClip(original_video_path)
-        clips = []
+# ==================== CREATE SHORTS ====================
+
+def create_shorts(original_video_path, segments, output_dir="shorts", fade_duration=0.4):
+    """Create vertical shorts from video segments."""
+    os.makedirs(output_dir, exist_ok=True)
+    video = VideoFileClip(original_video_path)
+    created_files = []
+    
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    
+    for i, seg in enumerate(segments, start=1):
+        status_text.text(f"Creating short {i}/{len(segments)}...")
         
-        for i, seg in enumerate(segments, start=1):
-            try:
-                start = float(seg['start'])
-                end = float(seg['end'])
-            except (KeyError, ValueError, TypeError):
-                st.warning(f"Skipping malformed segment: {seg}")
-                continue
+        try:
+            start = float(seg['start'])
+            end = float(seg['end'])
+        except (KeyError, ValueError, TypeError):
+            st.warning(f"Skipping malformed segment: {seg}")
+            continue
+        
+        if end <= start:
+            st.warning(f"Skipping invalid segment: {seg}")
+            continue
+        
+        # Cap at 59 seconds for YouTube Shorts
+        if end - start > 59:
+            end = start + 59
+        
+        try:
+            # Extract and convert to vertical
+            clip = video.subclip(start, end)
             
-            if end <= start:
-                st.warning(f"Skipping invalid segment (end <= start): {seg}")
-                continue
+            # Convert to vertical (9:16)
+            target_ratio = 1080 / 1920  # 0.5625
+            clip_ratio = clip.w / clip.h
             
-            # Legacy/v2.0 compatibility check handling for subclipping methods
-            if hasattr(video, 'subclipped'):
-                clip = video.subclipped(start, end).fadein(fade_duration).fadeout(fade_duration)
+            if clip_ratio > target_ratio:
+                new_width = int(clip.h * target_ratio)
+                x_center = clip.w / 2
+                clip = clip.crop(x1=x_center - new_width / 2, x2=x_center + new_width / 2)
             else:
-                clip = video.subclip(start, end).fadein(fade_duration).fadeout(fade_duration)
-            clips.append(clip)
-        
-        if clips:
-            final_clip = concatenate_videoclips(clips, method="compose")
-            final_clip.write_videofile(output_video_path, codec="libx264", audio_codec="aac", verbose=False, logger=None)
-            video.close()
-            final_clip.close()
-            for clip in clips:
-                clip.close()
-            return True
-        else:
-            st.error("No valid segments found to include in the edited video.")
-            return False
-
-# Streamlit UI Setup
-st.title("🎬 AI Video Editor")
-st.markdown("Create short, focused videos from longer content using AI-powered transcript analysis")
-
-# Sidebar Setup
-with st.sidebar:
-    st.header("⚙️ Configuration")
-    api_key = st.text_input("Groq API Key", type="password", help="Enter your Groq API key.")
-    whisper_model = st.selectbox("Whisper Model", ["base", "small", "medium", "large"], index=0)
-    
-    with st.expander("Advanced Options"):
-        max_tokens = st.slider("Max tokens per chunk", min_value=1000, max_value=8000, value=4000, step=500)
-        fade_duration = st.slider("Fade duration (seconds)", min_value=0.0, max_value=2.0, value=0.5, step=0.1)
-    
-    st.divider()
-    st.markdown("### 📋 Instructions\n1. Input your Groq API key.\n2. Add a video URL and state what you wish to crop.\n3. Run optimization pipelines.")
-
-# Layout Columns
-col1, col2 = st.columns([2, 1])
-
-with col1:
-    video_url = st.text_input("📹 Video URL", placeholder="https://www.youtube.com/watch?v=...")
-    user_query = st.text_area("📝 What do you want to extract from the video?", placeholder="e.g., 'Summarize key features'", height=100)
-    process_button = st.button("🚀 Process Video", type="primary", use_container_width=True)
-
-with col2:
-    st.markdown("### 📊 Details & Configuration")
-    status_placeholder = st.empty()
-    status_placeholder.info("Provide a video URL link to begin.")
-    
-    # Process and display metadata dynamically as inputs flow
-    if video_url:
-        try:
-            v_info = get_video_info_and_streams(video_url)
-            st.image(v_info["image"])
-            res_inp = st.selectbox('__Select Resolution Target__', v_info["resolutions"])
-            selected_index = v_info["resolutions"].index(res_inp)
+                new_height = int(clip.w / target_ratio)
+                y_center = clip.h / 2
+                clip = clip.crop(y1=y_center - new_height / 2, y2=y_center + new_height / 2)
             
-            st.write(f"**Title:** {v_info['title']}")
-            if v_info['length'] != "Unknown":
-                st.write(f"**Length:** {v_info['length']} sec")
-                
-            file_name_input = st.text_input('__Save as 🎯__', placeholder=v_info['title'])
-            file_name = file_name_input if file_name_input else v_info['title']
-            if not file_name.endswith(".mp4"):
-                file_name += ".mp4"
-            # Remove illegal characters from potential custom file names safely
-            file_name = re.sub(r'[\\/*?:"<>|]', "", file_name)
+            clip = clip.resize((1080, 1920))
+            clip = clip.fadein(fade_duration).fadeout(fade_duration)
+            
+            output_path = os.path.join(output_dir, f"short_{i}.mp4")
+            clip.write_videofile(output_path, codec="libx264", audio_codec="aac", fps=30, verbose=False, logger=None)
+            created_files.append(output_path)
+            clip.close()
+            
         except Exception as e:
-            st.error(f"Failed to pull streaming targets metadata profiles: {str(e)}")
+            st.warning(f"Failed to create short {i}: {str(e)}")
+            continue
+        
+        progress_bar.progress(i / len(segments))
+    
+    video.close()
+    status_text.empty()
+    progress_bar.empty()
+    
+    return created_files
 
-    # Display local computer download options once processing triggers success status
-    if st.session_state.processed and st.session_state.segments:
-        st.success(f"✅ Found {len(st.session_state.segments)} target elements.")
-        if os.path.exists("edited_output.mp4"):
-            with open("edited_output.mp4", "rb") as f:
-                st.download_button(
-                    label="📥 Download Processed Video File",
-                    data=f.read(),
-                    file_name=file_name if 'file_name' in locals() else "edited_video.mp4",
-                    mime="video/mp4",
-                    use_container_width=True
-                )
+# ==================== STREAMLIT UI ====================
 
-# Execution Workflow Controller Pipeline
-if process_button:
-    if not api_key:
-        st.error("Missing valid API access profiles.")
-    elif not video_url:
-        st.error("Missing validation link configuration parameter targets.")
-    elif not user_query:
-        st.error("Query structural criteria configurations unassigned.")
-    else:
-        try:
-            with tempfile.TemporaryDirectory() as temp_dir:
-                status_placeholder.info("📥 Downloading targeted video payload stream profile...")
-                
-                # Fetch targeting stream selection profiles
-                video_path = download_video_stream(video_url, temp_dir, v_info, selected_index)
-                
-                model = load_whisper_model(whisper_model)
-                transcription = transcribe_video(video_path, model)
-                st.session_state.transcript = transcription
-                
-                status_placeholder.info("🧠 Parsing structural indices using LLM parameters...")
-                relevant_segments = get_relevant_segments(transcription, user_query, api_key, max_tokens_per_chunk=max_tokens)
-                st.session_state.segments = relevant_segments
-                
-                status_placeholder.info("✂️ Clipping segments and compiling output file...")
-                output_path = os.path.join(temp_dir, "edited_output.mp4")
-                success = edit_video(video_path, relevant_segments, output_path, fade_duration=fade_duration)
-                
-                if success:
-                    import shutil
-                    shutil.copy(output_path, "edited_output.mp4")
-                    st.session_state.processed = True
-                    status_placeholder.success("💥 Compilation complete!")
-                    st.rerun()
-                else:
-                    status_placeholder.error("❌ Video encoding error encountered.")
-        except Exception as e:
-            status_placeholder.error(f"❌ Error context failure sequence: {str(e)}")
-            st.exception(e)
+st.title("🎬 YouTube Shorts Creator")
+st.markdown("Create engaging vertical shorts from YouTube videos using AI")
 
+# Main content
+tab1, tab2 = st.tabs(["🎯 Create Shorts", "📊 Trending Videos"])
+
+with tab1:
+    col1, col2 = st.columns([2, 1])
+    
+    with col1:
+        # Video URL input
+        video_url = st.text_input(
+            "📹 YouTube URL",
+            placeholder="https://www.youtube.com/watch?v=...",
+            help="Enter any YouTube video URL"
+        )
+        
+        # User query
+        user_query = st.text_area(
+            "📝 What kind of moments do you want?",
+            placeholder="e.g., 'Find the most engaging, funny, or educational moments that would work as shorts'",
+            height=80
+        )
+        
+        # Process button
+        col_btn1, col_btn2 = st.columns(2)
+        with col_btn1:
+            process_button = st.button(
+                "🚀 Create Shorts",
+                type="primary",
+                use_container_width=True
+            )
+        with col_btn2:
+            use_trending = st.button(
+                "🔥 Use Trending Video",
+                use_container_width=True
+            )
+        
+        # Show API status
+        st.info("✅ API keys are pre-configured and ready to use!")
+    
+    with col2:
+        st.markdown("### 📊 Status")
+        status_placeholder = st.empty()
+        status_placeholder.info("Ready to process")
+        
+        # Display results if available
+        if st.session_state.processed and st.session_state.shorts_created:
+            st.success(f"✅ Created {len(st.session_state.shorts_created)} shorts")
+            
+            # Preview first short
+            if st.session_state.shorts_created:
+                first_short = st.session_state.shorts_created[0]
+                if os.path.exists(first_short):
+                    st.video(first_short)
+            
+            # Download buttons for all shorts
+            st.markdown("### 📥 Download Shorts")
+            for i, short_path in enumerate(st.session_state.shorts_created, 1):
+                if os.path.exists(short_path):
+                    with open(short_path, "rb") as f:
+                        video_data = f.read()
+                    st.download_button(
+                        label=f"📥 Short {i}",
+                        data=video_data,
+                        file_name=f"short_{i}.mp4",
+                        mime="video/mp4",
+                        use_container_width=True,
+                        key=f"download_{i}"
+                    )
+    
+    # Processing logic
+    if use_trending:
+        video_url = None
+        status_placeholder.info("🔥 Fetching trending videos...")
+        top_videos = get_top_videos()
+        if top_videos:
+            video_url = top_videos[0]['youtube_url']
+            st.session_state.video_title = top_videos[0]['title']
+            status_placeholder.info(f"Selected: {top_videos[0]['title']}")
+            st.success(f"✅ Selected trending video: {top_videos[0]['title']}")
+            # Auto-fill the URL
+            st.rerun()
+        else:
+            status_placeholder.error("❌ Failed to fetch trending videos")
+    
+    if process_button:
+        if not video_url:
+            st.error("Please enter a YouTube URL or use a trending video")
+        elif not user_query:
+            st.error("Please describe what kind of moments you want")
+        else:
+            try:
+                # Create temp directory
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    status_placeholder.info("📥 Downloading video...")
+                    
+                    # Download video
+                    input_video = os.path.join(temp_dir, "input_video.mp4")
+                    success, result = download_video(video_url, input_video)
+                    
+                    if not success:
+                        st.error(f"Download failed: {result}")
+                        status_placeholder.error("❌ Download failed")
+                        st.stop()
+                    
+                    video_path = result
+                    status_placeholder.info("✅ Video downloaded successfully!")
+                    
+                    # Transcribe
+                    status_placeholder.info("🎤 Transcribing video...")
+                    transcription = transcribe_video(video_path, "base")
+                    st.session_state.transcript = transcription
+                    status_placeholder.info(f"✅ Transcription complete: {len(transcription)} segments")
+                    
+                    # Get relevant segments
+                    status_placeholder.info("🧠 Analyzing transcript for relevant segments...")
+                    relevant_segments = get_relevant_segments(
+                        transcription,
+                        user_query,
+                        max_tokens_per_chunk=4000
+                    )
+                    st.session_state.segments = relevant_segments
+                    status_placeholder.info(f"✅ Found {len(relevant_segments)} relevant segments")
+                    
+                    if not relevant_segments:
+                        st.warning("No relevant segments found. Try a different query.")
+                        status_placeholder.warning("No segments found")
+                        st.stop()
+                    
+                    # Create shorts
+                    status_placeholder.info("🎬 Creating vertical shorts...")
+                    shorts_dir = os.path.join(temp_dir, "shorts")
+                    shorts_files = create_shorts(
+                        video_path,
+                        relevant_segments,
+                        output_dir=shorts_dir,
+                        fade_duration=0.4
+                    )
+                    
+                    if shorts_files:
+                        # Copy shorts to current directory for download
+                        import shutil
+                        st.session_state.shorts_created = []
+                        for i, short_path in enumerate(shorts_files, 1):
+                            dest_path = f"short_{i}.mp4"
+                            shutil.copy(short_path, dest_path)
+                            st.session_state.shorts_created.append(dest_path)
+                        
+                        st.session_state.processed = True
+                        status_placeholder.success(f"✅ Created {len(shorts_files)} shorts!")
+                        st.balloons()
+                        st.rerun()
+                    else:
+                        status_placeholder.error("❌ No shorts were created")
+                        st.error("Failed to create shorts. Please check the segments and try again.")
+            
+            except Exception as e:
+                status_placeholder.error(f"❌ Error: {str(e)}")
+                st.exception(e)
+
+with tab2:
+    st.subheader("🔥 Trending YouTube Videos")
+    st.markdown("Top 10 most viewed videos from Kworb.net")
+    
+    if st.button("🔄 Refresh Trending Videos"):
+        with st.spinner("Fetching trending videos..."):
+            trending_videos = get_top_videos()
+            if trending_videos:
+                st.session_state.trending_videos = trending_videos
+                st.success(f"✅ Loaded {len(trending_videos)} trending videos!")
+    
+    if st.session_state.trending_videos:
+        for video in st.session_state.trending_videos:
+            with st.container():
+                col1, col2, col3 = st.columns([3, 1, 1])
+                with col1:
+                    st.markdown(f"**#{video['rank']}** - {video['title']}")
+                with col2:
+                    st.caption(f"👁️ {video['views']} views")
+                with col3:
+                    if st.button("Select", key=f"select_{video['video_id']}"):
+                        st.session_state.selected_url = video['youtube_url']
+                        st.session_state.video_title = video['title']
+                        st.success(f"✅ Selected: {video['title']}")
+                        # Switch to first tab
+                        st.rerun()
+
+# Display transcript preview if available
 if st.session_state.transcript:
-    with st.expander("📄 View Parsed Transcription Indexes"):
+    with st.expander("📄 View Transcript"):
         st.json(st.session_state.transcript[:10])
+        if len(st.session_state.transcript) > 10:
+            st.caption(f"... and {len(st.session_state.transcript) - 10} more segments")

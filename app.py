@@ -8,7 +8,7 @@ import shutil
 
 import requests
 import streamlit as st
-import whisper
+from faster_whisper import WhisperModel
 from bs4 import BeautifulSoup
 from moviepy.editor import VideoFileClip
 
@@ -212,18 +212,25 @@ def download_video_apify(youtube_url, output_filename, status_placeholder=None, 
 
 @st.cache_resource(show_spinner=False)
 def load_whisper_model(model_name="base"):
-    return whisper.load_model(model_name)
+    # CPU + int8 quantization keeps this fast and light on Streamlit Cloud's
+    # free-tier resources. No torch/triton/CUDA needed at all.
+    return WhisperModel(model_name, device="cpu", compute_type="int8")
 
 
 def transcribe_video(video_path, model_name="base"):
     model = load_whisper_model(model_name)
     audio_path = os.path.join(os.path.dirname(video_path), "temp_audio.wav")
     os.system(f'ffmpeg -y -i "{video_path}" -ar 16000 -ac 1 -b:a 64k -f mp3 "{audio_path}"')
-    result = model.transcribe(audio_path)
-    return [
-        {'start': seg['start'], 'end': seg['end'], 'text': seg['text'].strip()}
-        for seg in result['segments']
-    ]
+
+    segments_iter, info = model.transcribe(audio_path, beam_size=5)
+    transcription = []
+    for seg in segments_iter:
+        transcription.append({
+            'start': seg.start,
+            'end': seg.end,
+            'text': seg.text.strip()
+        })
+    return transcription
 
 
 # ==================== FIND RELEVANT SEGMENTS (GROQ) ====================

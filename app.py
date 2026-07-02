@@ -11,7 +11,7 @@ from moviepy.editor import VideoFileClip, concatenate_videoclips
 from pytubefix import YouTube
 from pytubefix.cli import on_progress
 import whisper
-
+import yt_dlp
 # ---- Compatibility shim for moviepy/Pillow ----
 from PIL import Image
 if not hasattr(Image, 'ANTIALIAS'):
@@ -171,57 +171,55 @@ def is_valid_youtube_url(url):
             return True
     return False
 
-def download_video_pytubefix(youtube_url, output_filename='input_video.mp4'):
-    """Download a YouTube video using pytubefix - WORKS!"""
-    try:
-        cleaned_url = clean_youtube_url(youtube_url)
-        
-        if not is_valid_youtube_url(cleaned_url):
-            return False, f"Invalid YouTube URL: {cleaned_url}"
-        
-        # Show progress in Streamlit
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-        
-        # Custom progress callback for pytubefix
-        def progress_callback(stream, chunk, bytes_remaining):
-            total_size = stream.filesize
-            bytes_downloaded = total_size - bytes_remaining
-            percentage = (bytes_downloaded / total_size) * 100
-            progress_bar.progress(min(percentage / 100, 0.95))
-            status_text.text(f"Downloading: {percentage:.1f}%")
-        
-        # Create YouTube object with progress callback
-        yt = YouTube(cleaned_url, on_progress_callback=progress_callback)
-        
-        # Get video info
-        video_title = yt.title
-        st.session_state.video_title = video_title
-        status_text.text(f"📹 Found: {video_title}")
-        
-        # Get the highest resolution stream (same as your working script)
-        video_download = yt.streams.get_highest_resolution()
-        
-        if not video_download:
-            return False, "No video stream available"
-        
-        # Download the video
-        status_text.text(f"⬇️ Downloading: {video_title}")
-        
-        # Use the same approach as your working script
-        video_path = video_download.download(
-            output_path=os.path.dirname(output_filename),
-            filename=os.path.basename(output_filename)
-        )
-        
-        progress_bar.progress(1.0)
-        status_text.text("✅ Download complete!")
-        
-        return True, video_path
-        
-    except Exception as e:
-        return False, f"Download error: {str(e)}"
 
+
+def download_video_ytdlp(youtube_url, output_dir):
+    """Download a YouTube video using yt-dlp."""
+    cleaned_url = clean_youtube_url(youtube_url)
+
+    if not is_valid_youtube_url(cleaned_url):
+        return False, f"Invalid YouTube URL: {cleaned_url}"
+
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    video_title_holder = {}
+
+    def progress_hook(d):
+        if d['status'] == 'downloading':
+            total = d.get('total_bytes') or d.get('total_bytes_estimate')
+            downloaded = d.get('downloaded_bytes', 0)
+            if total:
+                pct = downloaded / total
+                progress_bar.progress(min(pct, 0.95))
+                status_text.text(f"Downloading: {pct*100:.1f}%")
+        elif d['status'] == 'finished':
+            progress_bar.progress(1.0)
+            status_text.text("✅ Download complete!")
+
+    output_template = os.path.join(output_dir, "input_video.%(ext)s")
+
+    ydl_opts = {
+        "format": "best[ext=mp4]/best",
+        "outtmpl": output_template,
+        "progress_hooks": [progress_hook],
+        "quiet": True,
+        "no_warnings": True,
+    }
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(cleaned_url, download=True)
+            video_title_holder['title'] = info.get('title', 'video')
+            filepath = ydl.prepare_filename(info)
+
+        st.session_state.video_title = video_title_holder['title']
+        return True, filepath
+
+    except yt_dlp.utils.DownloadError as e:
+        return False, f"Download error: {str(e)}"
+    except Exception as e:
+        return False, f"Unexpected error: {str(e)}"
+        
 def get_top_videos():
     """Scrape top 10 most viewed videos from Kworb.net."""
     url = 'https://kworb.net/youtube/'

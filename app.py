@@ -7,7 +7,7 @@ import tempfile
 import streamlit as st
 import requests
 from bs4 import BeautifulSoup
-from moviepy.editor import VideoFileClip, concatenate_videoclips
+from moviepy import VideoFileClip, concatenate_videoclips
 import whisper
 
 # ---- Compatibility shim for moviepy/Pillow ----

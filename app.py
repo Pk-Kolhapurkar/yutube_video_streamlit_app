@@ -7,7 +7,7 @@ import tempfile
 import streamlit as st
 import requests
 from bs4 import BeautifulSoup
-from moviepy import VideoFileClip, concatenate_videoclips
+from moviepy.editor import VideoFileClip, concatenate_videoclips
 from pytubefix import YouTube
 from pytubefix.cli import on_progress
 import whisper

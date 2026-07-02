@@ -7,7 +7,7 @@ import tempfile
 import streamlit as st
 import requests
 from bs4 import BeautifulSoup
-from moviepy import VideoFileClip, concatenate_videoclips
+from moviepy.editor import VideoFileClip, concatenate_videoclips
 import whisper
 
 # ---- Compatibility shim for moviepy/Pillow ----
@@ -16,9 +16,10 @@ if not hasattr(Image, 'ANTIALIAS'):
     Image.ANTIALIAS = Image.LANCZOS
 
 # ==================== HARDCODED CONFIGURATION ====================
+# WARNING: These are hardcoded for testing. Rotate/revoke before sharing.
 APIFY_API_TOKEN = "apify_api_ddMBOcNe4LMijVOsErHSJDfvgUMlfE1Pi3LQ"
 APIFY_ACTOR_ID = "streamers~youtube-video-downloader"
-GROQ_API_KEY = "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"
+# GROQ_API_KEY is now taken from sidebar input
 
 # ==================== PAGE CONFIG ====================
 st.set_page_config(
@@ -40,6 +41,72 @@ if 'video_title' not in st.session_state:
     st.session_state.video_title = ""
 if 'trending_videos' not in st.session_state:
     st.session_state.trending_videos = []
+if 'groq_api_key' not in st.session_state:
+    st.session_state.groq_api_key = ""
+
+# ==================== SIDEBAR ====================
+with st.sidebar:
+    st.header("⚙️ Configuration")
+    
+    # Groq API Key input
+    groq_api_key = st.text_input(
+        "🔑 Groq API Key",
+        type="password",
+        placeholder="Enter your Groq API key",
+        help="Get your API key from https://console.groq.com",
+        value=st.session_state.groq_api_key
+    )
+    
+    if groq_api_key:
+        st.session_state.groq_api_key = groq_api_key
+        st.success("✅ API Key set successfully!")
+    else:
+        st.warning("⚠️ Please enter your Groq API key")
+    
+    st.divider()
+    
+    # Model selection
+    whisper_model = st.selectbox(
+        "🎤 Whisper Model",
+        ["base", "small", "medium", "large"],
+        index=0,
+        help="Larger models are more accurate but slower"
+    )
+    
+    with st.expander("⚡ Advanced Options"):
+        max_tokens = st.slider(
+            "Max tokens per chunk",
+            min_value=1000,
+            max_value=8000,
+            value=4000,
+            step=500
+        )
+        fade_duration = st.slider(
+            "Fade duration (seconds)",
+            min_value=0.0,
+            max_value=2.0,
+            value=0.4,
+            step=0.1
+        )
+        delay_between_chunks = st.slider(
+            "Delay between API calls (seconds)",
+            min_value=1.0,
+            max_value=10.0,
+            value=3.0,
+            step=0.5,
+            help="Increase this if you're hitting rate limits"
+        )
+    
+    st.divider()
+    st.markdown("### 📋 How it works")
+    st.markdown("""
+    1. Enter your Groq API Key
+    2. Enter a YouTube URL or pick from trending videos
+    3. Describe what kind of moments you want
+    4. The app will download, transcribe, and analyze the video
+    5. AI selects the most relevant segments
+    6. Creates vertical shorts ready for YouTube
+    """)
 
 # ==================== VIDEO DOWNLOAD FUNCTIONS ====================
 
@@ -441,7 +508,8 @@ def _chunk_transcript(transcript, max_tokens_per_chunk=4000):
         chunks.append(current_chunk)
     return chunks
 
-def call_groq(prompt_transcript, user_query, max_retries=4):
+def call_groq(prompt_transcript, user_query, groq_api_key, max_retries=5):
+    """Call Groq API with improved rate limiting handling."""
     prompt = f"""You are an expert video editor who can read video transcripts and perform video editing. Given a transcript with segments, your task is to identify all the conversations related to a user query. A group of continuous segments in the transcript is a conversation.
 
 Guidelines:
@@ -467,7 +535,7 @@ User query:
     url = "https://api.groq.com/openai/v1/chat/completions"
     headers = {
         "Content-Type": "application/json",
-        "Authorization": f"Bearer {GROQ_API_KEY}"
+        "Authorization": f"Bearer {groq_api_key}"
     }
     data = {
         "messages": [
@@ -484,55 +552,91 @@ User query:
     }
 
     for attempt in range(1, max_retries + 1):
-        response = requests.post(url, headers=headers, json=data)
-        
-        if response.status_code == 429 or response.status_code == 413:
-            wait = min(2 ** attempt, 30)
-            time.sleep(wait)
-            continue
-        
         try:
-            response_data = response.json()
-        except ValueError:
-            raise RuntimeError(f"Non-JSON response from API: {response.text}")
-        
-        if response.status_code != 200:
-            raise RuntimeError(f"API request failed ({response.status_code}): {response_data}")
-        
-        if not response_data.get("choices"):
-            raise RuntimeError(f"Unexpected API response structure: {response_data}")
-        
-        choice = response_data["choices"][0]
-        message = choice.get("message") or choice
-        raw_content = message.get("content") if isinstance(message, dict) else None
-        if raw_content is None:
-            raise RuntimeError(f"Missing message content in API response: {response_data}")
-        
-        raw_content = raw_content.strip()
-        try:
-            json_text = _extract_json_payload(raw_content)
-        except ValueError as exc:
-            raise RuntimeError(f"Could not extract JSON payload from API response: {raw_content}\nError: {exc}")
-        
-        try:
-            conversations = json.loads(json_text)
-        except ValueError:
+            response = requests.post(url, headers=headers, json=data, timeout=30)
+            
+            # Handle rate limiting with exponential backoff
+            if response.status_code == 429:
+                wait_time = min(2 ** attempt * 2, 60)  # Exponential backoff: 4, 8, 16, 32, 60
+                st.warning(f"Rate limited (429). Waiting {wait_time}s before retry {attempt}/{max_retries}...")
+                time.sleep(wait_time)
+                continue
+            
+            if response.status_code == 413:
+                st.warning(f"Request too large (413). Reducing chunk size...")
+                time.sleep(2)
+                continue
+            
+            if response.status_code != 200:
+                error_msg = f"API request failed (status {response.status_code})"
+                try:
+                    error_detail = response.json()
+                    error_msg += f": {error_detail}"
+                except:
+                    error_msg += f": {response.text[:200]}"
+                raise RuntimeError(error_msg)
+            
             try:
-                conversations = ast.literal_eval(json_text)
-            except Exception as exc:
-                raise RuntimeError(f"Could not parse extracted response content as JSON: {json_text}\nError: {exc}")
-        
-        if isinstance(conversations, list):
-            return conversations
-        
-        if not isinstance(conversations, dict) or "conversations" not in conversations:
-            raise RuntimeError(f"Parsed API response does not contain conversations: {conversations}")
-        
-        return conversations["conversations"]
+                response_data = response.json()
+            except ValueError:
+                raise RuntimeError(f"Non-JSON response from API: {response.text[:200]}")
+            
+            if not response_data.get("choices"):
+                raise RuntimeError(f"Unexpected API response structure: {response_data}")
+            
+            choice = response_data["choices"][0]
+            message = choice.get("message") or choice
+            raw_content = message.get("content") if isinstance(message, dict) else None
+            
+            if raw_content is None:
+                raise RuntimeError(f"Missing message content in API response")
+            
+            raw_content = raw_content.strip()
+            
+            try:
+                json_text = _extract_json_payload(raw_content)
+            except ValueError as exc:
+                raise RuntimeError(f"Could not extract JSON payload from API response: {raw_content[:200]}")
+            
+            try:
+                conversations = json.loads(json_text)
+            except ValueError:
+                try:
+                    conversations = ast.literal_eval(json_text)
+                except Exception as exc:
+                    raise RuntimeError(f"Could not parse response as JSON: {json_text[:200]}")
+            
+            if isinstance(conversations, list):
+                return conversations
+            
+            if not isinstance(conversations, dict) or "conversations" not in conversations:
+                raise RuntimeError(f"Response does not contain 'conversations' field")
+            
+            return conversations["conversations"]
+            
+        except requests.exceptions.Timeout:
+            st.warning(f"Request timeout. Retry {attempt}/{max_retries}...")
+            time.sleep(2)
+            continue
+        except requests.exceptions.ConnectionError:
+            st.warning(f"Connection error. Retry {attempt}/{max_retries}...")
+            time.sleep(3)
+            continue
+        except Exception as e:
+            if attempt == max_retries:
+                raise
+            st.warning(f"Error: {str(e)}. Retry {attempt}/{max_retries}...")
+            time.sleep(2)
+            continue
     
-    raise RuntimeError("Exceeded max retries due to repeated rate limiting.")
+    raise RuntimeError(f"Exceeded max retries ({max_retries}) due to repeated errors.")
 
-def get_relevant_segments(transcript, user_query, max_tokens_per_chunk=4000, delay_between_chunks=2.0):
+def get_relevant_segments(transcript, user_query, groq_api_key, max_tokens_per_chunk=4000, delay_between_chunks=3.0):
+    """Get relevant segments with improved error handling."""
+    if not groq_api_key:
+        st.error("❌ Please enter your Groq API key in the sidebar")
+        return []
+    
     chunks = _chunk_transcript(transcript, max_tokens_per_chunk=max_tokens_per_chunk)
     progress_bar = st.progress(0)
     status_text = st.empty()
@@ -540,20 +644,31 @@ def get_relevant_segments(transcript, user_query, max_tokens_per_chunk=4000, del
     all_conversations = []
     total_chunks = len(chunks)
     
+    if total_chunks == 0:
+        st.warning("No chunks to process")
+        return []
+    
     for i, chunk in enumerate(chunks, start=1):
         status_text.text(f"Processing chunk {i}/{total_chunks}...")
+        
         try:
-            conversations = call_groq(chunk, user_query)
+            conversations = call_groq(chunk, user_query, groq_api_key)
             all_conversations.extend(conversations)
+            st.info(f"✅ Chunk {i}: Found {len(conversations)} segments")
         except RuntimeError as exc:
-            st.warning(f"Chunk {i} failed and will be skipped: {exc}")
+            st.warning(f"⚠️ Chunk {i} failed: {str(exc)}")
+        except Exception as exc:
+            st.error(f"❌ Chunk {i} unexpected error: {str(exc)}")
         
         progress_bar.progress(i / total_chunks)
+        
+        # Add delay between chunks to avoid rate limiting
         if i < len(chunks):
             time.sleep(delay_between_chunks)
     
     status_text.empty()
     progress_bar.empty()
+    
     return all_conversations
 
 # ==================== CREATE SHORTS ====================
@@ -674,7 +789,10 @@ with tab1:
             )
         
         # Show API status
-        st.info("✅ API keys are pre-configured and ready to use!")
+        if st.session_state.groq_api_key:
+            st.success("✅ Groq API key is configured!")
+        else:
+            st.warning("⚠️ Please enter your Groq API key in the sidebar")
     
     with col2:
         st.markdown("### 📊 Status")
@@ -716,13 +834,14 @@ with tab1:
             st.session_state.video_title = top_videos[0]['title']
             status_placeholder.info(f"Selected: {top_videos[0]['title']}")
             st.success(f"✅ Selected trending video: {top_videos[0]['title']}")
-            # Auto-fill the URL
             st.rerun()
         else:
             status_placeholder.error("❌ Failed to fetch trending videos")
     
     if process_button:
-        if not video_url:
+        if not st.session_state.groq_api_key:
+            st.error("❌ Please enter your Groq API key in the sidebar")
+        elif not video_url:
             st.error("Please enter a YouTube URL or use a trending video")
         elif not user_query:
             st.error("Please describe what kind of moments you want")
@@ -746,7 +865,7 @@ with tab1:
                     
                     # Transcribe
                     status_placeholder.info("🎤 Transcribing video...")
-                    transcription = transcribe_video(video_path, "base")
+                    transcription = transcribe_video(video_path, whisper_model)
                     st.session_state.transcript = transcription
                     status_placeholder.info(f"✅ Transcription complete: {len(transcription)} segments")
                     
@@ -755,15 +874,18 @@ with tab1:
                     relevant_segments = get_relevant_segments(
                         transcription,
                         user_query,
-                        max_tokens_per_chunk=4000
+                        st.session_state.groq_api_key,
+                        max_tokens_per_chunk=max_tokens,
+                        delay_between_chunks=delay_between_chunks
                     )
                     st.session_state.segments = relevant_segments
-                    status_placeholder.info(f"✅ Found {len(relevant_segments)} relevant segments")
                     
                     if not relevant_segments:
                         st.warning("No relevant segments found. Try a different query.")
                         status_placeholder.warning("No segments found")
                         st.stop()
+                    
+                    status_placeholder.info(f"✅ Found {len(relevant_segments)} relevant segments")
                     
                     # Create shorts
                     status_placeholder.info("🎬 Creating vertical shorts...")
@@ -772,7 +894,7 @@ with tab1:
                         video_path,
                         relevant_segments,
                         output_dir=shorts_dir,
-                        fade_duration=0.4
+                        fade_duration=fade_duration
                     )
                     
                     if shorts_files:
@@ -820,7 +942,6 @@ with tab2:
                         st.session_state.selected_url = video['youtube_url']
                         st.session_state.video_title = video['title']
                         st.success(f"✅ Selected: {video['title']}")
-                        # Switch to first tab
                         st.rerun()
 
 # Display transcript preview if available

@@ -1,10 +1,5 @@
 
 openai-whisper 
-
-beautifulsoup4 
-whisper 
-Pillow
-
 streamlit==1.31.0
 requests==2.31.0
 beautifulsoup4==4.12.2

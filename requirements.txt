@@ -1,5 +1,5 @@
 
-openai-whisper pytubefix>=2.0.0
+openai-whisper 
 
 beautifulsoup4 
 whisper 

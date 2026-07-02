@@ -5,5 +5,5 @@ requests==2.31.0
 beautifulsoup4==4.12.2
 moviepy==1.0.3
 openai-whisper
-Pillow==10.1.0
+Pillow>=10.4.0
 pytubefix==10.10.1

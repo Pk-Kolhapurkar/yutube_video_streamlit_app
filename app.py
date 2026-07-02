@@ -7,7 +7,7 @@ import tempfile
 import streamlit as st
 import requests
 from bs4 import BeautifulSoup
-from moviepy import VideoFileClip, concatenate_videoclips
+from moviepy.editor import VideoFileClip, concatenate_videoclips
 import whisper
 
 # ---- Compatibility shim for moviepy/Pillow ----
@@ -16,7 +16,6 @@ if not hasattr(Image, 'ANTIALIAS'):
     Image.ANTIALIAS = Image.LANCZOS
 
 # ==================== HARDCODED CONFIGURATION ====================
-# WARNING: These are hardcoded for testing. Rotate/revoke before sharing.
 APIFY_API_TOKEN = "apify_api_ddMBOcNe4LMijVOsErHSJDfvgUMlfE1Pi3LQ"
 APIFY_ACTOR_ID = "streamers~youtube-video-downloader"
 GROQ_API_KEY = "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"
@@ -347,7 +346,19 @@ def transcribe_video(video_path, model_name="base"):
         # Extract audio using moviepy
         video = VideoFileClip(video_path)
         audio_path = os.path.join(os.path.dirname(video_path), "temp_audio.wav")
-        video.audio.write_audiofile(audio_path, verbose=False, logger=None)
+        
+        # Try different parameter combinations for compatibility
+        try:
+            # Newer moviepy versions (1.0.3+)
+            video.audio.write_audiofile(audio_path, logger=None)
+        except TypeError:
+            try:
+                # Older moviepy versions
+                video.audio.write_audiofile(audio_path, verbose=False, logger=None)
+            except TypeError:
+                # Fallback with minimal parameters
+                video.audio.write_audiofile(audio_path)
+        
         video.close()
         
         # Transcribe
@@ -595,7 +606,18 @@ def create_shorts(original_video_path, segments, output_dir="shorts", fade_durat
             clip = clip.fadein(fade_duration).fadeout(fade_duration)
             
             output_path = os.path.join(output_dir, f"short_{i}.mp4")
-            clip.write_videofile(output_path, codec="libx264", audio_codec="aac", fps=30, verbose=False, logger=None)
+            
+            # Try different write parameters for compatibility
+            try:
+                clip.write_videofile(output_path, codec="libx264", audio_codec="aac", fps=30, 
+                                   verbose=False, logger=None)
+            except TypeError:
+                try:
+                    clip.write_videofile(output_path, codec="libx264", audio_codec="aac", fps=30,
+                                       logger=None)
+                except TypeError:
+                    clip.write_videofile(output_path, codec="libx264", audio_codec="aac", fps=30)
+            
             created_files.append(output_path)
             clip.close()
             

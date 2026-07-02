@@ -106,9 +106,9 @@ def load_whisper_model(model_name="base"):
 
 @st.cache_data
 def get_video_info_and_streams(url):
-    """Bypasses 403 restrictions and fetches progressive formats with explicit info arrays"""
+    """Bypasses 403 restrictions using client OAuth profiles securely"""
     if "youtube.com" in url or "youtu.be" in url:
-        yt = YouTube(url, client='web')
+        yt = YouTube(url, use_oauth=True, allow_oauth_cache=True)
         streams = yt.streams.filter(progressive=True, type='video')
         details = {
             "is_youtube": True,
@@ -148,20 +148,20 @@ def get_video_info_and_streams(url):
         }
 
 def download_video_stream(url, output_path, v_info, selected_index=0):
-    """Downloads chosen format streams directly into transient file pathways securely"""
+    """Downloads chosen format streams securely into temporary storage"""
     video_path = os.path.join(output_path, "input_video.mp4")
     
     if v_info.get("is_youtube"):
         try:
             chosen_itag = v_info['itag'][selected_index]
-            yt = YouTube(url, client='web')
+            yt = YouTube(url, use_oauth=True, allow_oauth_cache=True)
             ds = yt.streams.get_by_itag(chosen_itag)
             if ds:
                 ds.download(output_path=output_path, filename="input_video.mp4")
                 if os.path.exists(video_path) and os.path.getsize(video_path) > 1000:
                     return video_path
         except Exception as e:
-            st.warning(f"Targeted stream pull failed: {str(e)}. Trying generic stream retrieval...")
+            st.warning(f"Targeted stream download failed: {str(e)}. Trying generic stream retrieval...")
 
     # Fallback/Direct HTTP fetch execution block
     try:
@@ -177,7 +177,7 @@ def download_video_stream(url, output_path, v_info, selected_index=0):
     except Exception as e:
         pass
         
-    raise ValueError("File stream generation failed. Ensure your link is accessible.")
+    raise ValueError("File stream generation failed. Ensure your link is valid and accessible.")
 
 def transcribe_video(video_path, model):
     with st.spinner("Transcribing video... This may take a while..."):
@@ -313,7 +313,6 @@ def edit_video(original_video_path, segments, output_video_path, fade_duration=0
         
         for i, seg in enumerate(segments, start=1):
             try:
-                # Update methods to match modern MoviePy v2.0 structures cleanly
                 start = float(seg['start'])
                 end = float(seg['end'])
             except (KeyError, ValueError, TypeError):
@@ -324,7 +323,7 @@ def edit_video(original_video_path, segments, output_video_path, fade_duration=0
                 st.warning(f"Skipping invalid segment (end <= start): {seg}")
                 continue
             
-            # Legacy compatibility check handling for .subclipped vs .subclip methods
+            # Legacy/v2.0 compatibility check handling for subclipping methods
             if hasattr(video, 'subclipped'):
                 clip = video.subclipped(start, end).fadein(fade_duration).fadeout(fade_duration)
             else:
@@ -347,7 +346,7 @@ def edit_video(original_video_path, segments, output_video_path, fade_duration=0
 st.title("🎬 AI Video Editor")
 st.markdown("Create short, focused videos from longer content using AI-powered transcript analysis")
 
-# Sidebar
+# Sidebar Setup
 with st.sidebar:
     st.header("⚙️ Configuration")
     api_key = st.text_input("Groq API Key", type="password", help="Enter your Groq API key.")
@@ -358,9 +357,9 @@ with st.sidebar:
         fade_duration = st.slider("Fade duration (seconds)", min_value=0.0, max_value=2.0, value=0.5, step=0.1)
     
     st.divider()
-    st.markdown("### 📋 Instructions\n1. Provide your Key.\n2. Query configurations.\n3. Run automation pipelines.")
+    st.markdown("### 📋 Instructions\n1. Input your Groq API key.\n2. Add a video URL and state what you wish to crop.\n3. Run optimization pipelines.")
 
-# Form Input Segments
+# Layout Columns
 col1, col2 = st.columns([2, 1])
 
 with col1:
@@ -371,14 +370,14 @@ with col1:
 with col2:
     st.markdown("### 📊 Details & Configuration")
     status_placeholder = st.empty()
-    status_placeholder.info("Provide URL link targets to start.")
+    status_placeholder.info("Provide a video URL link to begin.")
     
-    # Render Stream options dynamically as inputs flow
+    # Process and display metadata dynamically as inputs flow
     if video_url:
         try:
             v_info = get_video_info_and_streams(video_url)
             st.image(v_info["image"])
-            res_inp = st.selectbox('__Select Streaming Target Resolution__', v_info["resolutions"])
+            res_inp = st.selectbox('__Select Resolution Target__', v_info["resolutions"])
             selected_index = v_info["resolutions"].index(res_inp)
             
             st.write(f"**Title:** {v_info['title']}")
@@ -389,12 +388,12 @@ with col2:
             file_name = file_name_input if file_name_input else v_info['title']
             if not file_name.endswith(".mp4"):
                 file_name += ".mp4"
-            # Sanitize filename string constraints securely
+            # Remove illegal characters from potential custom file names safely
             file_name = re.sub(r'[\\/*?:"<>|]', "", file_name)
         except Exception as e:
             st.error(f"Failed to pull streaming targets metadata profiles: {str(e)}")
 
-    # Standard browser level persistence outputs download mapping
+    # Display local computer download options once processing triggers success status
     if st.session_state.processed and st.session_state.segments:
         st.success(f"✅ Found {len(st.session_state.segments)} target elements.")
         if os.path.exists("edited_output.mp4"):
@@ -407,20 +406,20 @@ with col2:
                     use_container_width=True
                 )
 
-# Automation Controller Execution Workflow Pipeline Routing
+# Execution Workflow Controller Pipeline
 if process_button:
     if not api_key:
-        st.error("Missing valid API access profiles")
+        st.error("Missing valid API access profiles.")
     elif not video_url:
-        st.error("Missing validation link configuration parameter targets")
+        st.error("Missing validation link configuration parameter targets.")
     elif not user_query:
-        st.error("Query structural criteria configurations unassigned")
+        st.error("Query structural criteria configurations unassigned.")
     else:
         try:
             with tempfile.TemporaryDirectory() as temp_dir:
                 status_placeholder.info("📥 Downloading targeted video payload stream profile...")
                 
-                # Use updated resolution target parameter download schema
+                # Fetch targeting stream selection profiles
                 video_path = download_video_stream(video_url, temp_dir, v_info, selected_index)
                 
                 model = load_whisper_model(whisper_model)
@@ -431,7 +430,7 @@ if process_button:
                 relevant_segments = get_relevant_segments(transcription, user_query, api_key, max_tokens_per_chunk=max_tokens)
                 st.session_state.segments = relevant_segments
                 
-                status_placeholder.info("✂️ Stripping irrelevant segments...")
+                status_placeholder.info("✂️ Clipping segments and compiling output file...")
                 output_path = os.path.join(temp_dir, "edited_output.mp4")
                 success = edit_video(video_path, relevant_segments, output_path, fade_duration=fade_duration)
                 
@@ -439,7 +438,7 @@ if process_button:
                     import shutil
                     shutil.copy(output_path, "edited_output.mp4")
                     st.session_state.processed = True
-                    status_placeholder.success("💥 Compilation structural configuration parameters set!")
+                    status_placeholder.success("💥 Compilation complete!")
                     st.rerun()
                 else:
                     status_placeholder.error("❌ Video encoding error encountered.")

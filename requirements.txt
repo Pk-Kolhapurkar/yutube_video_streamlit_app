@@ -1,5 +1,5 @@
 streamlit 
 moviepy 
 openai-whisper 
-pytubefix 
+pytubefix>=2.0.0
 requests

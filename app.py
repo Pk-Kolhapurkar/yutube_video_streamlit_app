@@ -7,7 +7,9 @@ import tempfile
 import streamlit as st
 import requests
 from bs4 import BeautifulSoup
-from moviepy import VideoFileClip, concatenate_videoclips
+from moviepy.editor import VideoFileClip, concatenate_videoclips
+from pytubefix import YouTube
+from pytubefix.cli import on_progress
 import whisper
 
 # ---- Compatibility shim for moviepy/Pillow ----
@@ -16,10 +18,7 @@ if not hasattr(Image, 'ANTIALIAS'):
     Image.ANTIALIAS = Image.LANCZOS
 
 # ==================== HARDCODED CONFIGURATION ====================
-# WARNING: These are hardcoded for testing. Rotate/revoke before sharing.
-APIFY_API_TOKEN = "apify_api_ddMBOcNe4LMijVOsErHSJDfvgUMlfE1Pi3LQ"
-APIFY_ACTOR_ID = "streamers~youtube-video-downloader"
-# GROQ_API_KEY is now taken from sidebar input
+# GROQ_API_KEY is taken from sidebar input
 
 # ==================== PAGE CONFIG ====================
 st.set_page_config(
@@ -65,9 +64,19 @@ with st.sidebar:
     
     st.divider()
     
+    # Download quality options
+    st.subheader("📥 Download Options")
+    download_quality = st.selectbox(
+        "Video Quality",
+        ["highest", "lowest", "audio_only"],
+        index=0,
+        help="Select the quality to download"
+    )
+    
     # Model selection
+    st.subheader("🎤 Transcription")
     whisper_model = st.selectbox(
-        "🎤 Whisper Model",
+        "Whisper Model",
         ["base", "small", "medium", "large"],
         index=0,
         help="Larger models are more accurate but slower"
@@ -107,6 +116,9 @@ with st.sidebar:
     5. AI selects the most relevant segments
     6. Creates vertical shorts ready for YouTube
     """)
+    
+    st.divider()
+    st.caption("⚡ Powered by pytubefix, Whisper, and Groq")
 
 # ==================== VIDEO DOWNLOAD FUNCTIONS ====================
 
@@ -158,6 +170,69 @@ def is_valid_youtube_url(url):
         if re.match(pattern, url):
             return True
     return False
+
+def download_video_pytubefix(youtube_url, output_filename='input_video.mp4', quality='highest'):
+    """Download a YouTube video using pytubefix."""
+    try:
+        cleaned_url = clean_youtube_url(youtube_url)
+        
+        if not is_valid_youtube_url(cleaned_url):
+            return False, f"Invalid YouTube URL: {cleaned_url}"
+        
+        # Show progress in Streamlit
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        
+        # Custom progress callback for pytubefix
+        def progress_callback(stream, chunk, bytes_remaining):
+            total_size = stream.filesize
+            bytes_downloaded = total_size - bytes_remaining
+            percentage = (bytes_downloaded / total_size) * 100
+            progress_bar.progress(min(percentage / 100, 0.95))
+            status_text.text(f"Downloading: {percentage:.1f}%")
+        
+        # Create YouTube object with progress callback
+        yt = YouTube(cleaned_url, on_progress_callback=progress_callback)
+        
+        # Get video info
+        video_title = yt.title
+        st.session_state.video_title = video_title
+        status_text.text(f"📹 Found: {video_title}")
+        
+        # Select stream based on quality
+        if quality == 'audio_only':
+            stream = yt.streams.get_audio_only()
+            if not stream:
+                return False, "No audio stream available"
+        elif quality == 'lowest':
+            stream = yt.streams.get_lowest_resolution()
+            if not stream:
+                stream = yt.streams.first()
+        else:  # highest
+            stream = yt.streams.get_highest_resolution()
+            if not stream:
+                stream = yt.streams.first()
+        
+        if not stream:
+            return False, "No suitable stream found"
+        
+        # Download the video
+        status_text.text(f"⬇️ Downloading: {video_title}")
+        video_path = stream.download(output_path=os.path.dirname(output_filename), 
+                                    filename=os.path.basename(output_filename))
+        
+        progress_bar.progress(1.0)
+        status_text.text("✅ Download complete!")
+        
+        # If it's an audio-only download, convert to mp4 container for compatibility
+        if quality == 'audio_only' and video_path.endswith('.mp4'):
+            # Audio-only downloads from pytubefix are usually in mp4 container
+            pass
+        
+        return True, video_path
+        
+    except Exception as e:
+        return False, f"Download error: {str(e)}"
 
 def get_top_videos():
     """Scrape top 10 most viewed videos from Kworb.net."""
@@ -214,190 +289,6 @@ def get_top_videos():
     except Exception as e:
         st.error(f"Error fetching top videos: {e}")
         return []
-
-def _find_best_video_url(video_data):
-    """Find the best video URL from Apify response."""
-    # Prefer Apify-hosted stable copies
-    stable_fields = ['downloadedFileUrl', 'fileUrl']
-    for field in stable_fields:
-        value = video_data.get(field)
-        if isinstance(value, str) and value.startswith('http'):
-            return value, True
-    
-    # Fall back to signed URLs
-    priority_fields = [
-        'muxedUrl', 'combinedUrl', 'videoUrl', 'hdUrl', 'sdUrl',
-        'downloadUrl', 'url', 'download', 'link', 'videoOnlyUrl'
-    ]
-    for field in priority_fields:
-        value = video_data.get(field)
-        if isinstance(value, str) and value.startswith('http'):
-            return value, False
-    
-    # Check nested structures
-    for key in ('video', 'file', 'result', 'formats'):
-        nested = video_data.get(key)
-        if isinstance(nested, dict):
-            for sub_field in ('url', 'downloadUrl', 'muxedUrl'):
-                if nested.get(sub_field):
-                    return nested[sub_field], False
-        elif isinstance(nested, list) and nested:
-            first = nested[0]
-            if isinstance(first, dict):
-                for sub_field in ('url', 'downloadUrl'):
-                    if first.get(sub_field):
-                        return first[sub_field], False
-    
-    return None, False
-
-def download_video_apify(youtube_url, output_filename='input_video.mp4'):
-    """Download a YouTube video using Apify's API."""
-    try:
-        cleaned_url = clean_youtube_url(youtube_url)
-        
-        if not is_valid_youtube_url(cleaned_url):
-            return False, f"Invalid YouTube URL: {cleaned_url}"
-        
-        video_id = extract_video_id(cleaned_url)
-        
-        input_data = {"videos": [{"url": cleaned_url}]}
-        
-        api_base = "https://api.apify.com/v2"
-        headers = {
-            'Authorization': f'Bearer {APIFY_API_TOKEN}',
-            'Content-Type': 'application/json'
-        }
-        
-        start_url = f"{api_base}/actors/{APIFY_ACTOR_ID}/runs"
-        response = requests.post(start_url, json=input_data, headers=headers)
-        
-        if response.status_code != 201:
-            error_detail = response.text[:500]
-            return False, f"Failed to start actor (status {response.status_code}): {error_detail}"
-        
-        run_data = response.json()
-        run_id = run_data['data']['id']
-        
-        # Wait for completion
-        max_attempts = 120
-        attempts = 0
-        status_data = None
-        
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-        
-        while attempts < max_attempts:
-            status_url = f"{api_base}/actor-runs/{run_id}"
-            status_response = requests.get(status_url, headers=headers)
-            
-            if status_response.status_code != 200:
-                time.sleep(5)
-                attempts += 1
-                continue
-            
-            status_data = status_response.json()
-            current_status = status_data['data']['status']
-            
-            # Update progress
-            progress = min(attempts / max_attempts, 0.9)
-            progress_bar.progress(progress)
-            status_text.text(f"Downloading video... Status: {current_status}")
-            
-            if current_status == 'SUCCEEDED':
-                break
-            elif current_status in ['FAILED', 'ABORTED', 'TIMED-OUT']:
-                return False, f"Actor run {current_status}"
-            
-            attempts += 1
-            time.sleep(5)
-        
-        progress_bar.progress(1.0)
-        status_text.text("Download complete! Processing results...")
-        
-        if attempts >= max_attempts:
-            return False, "Actor run timed out after 10 minutes"
-        
-        # Get results
-        dataset_id = status_data['data']['defaultDatasetId']
-        results_url = f"{api_base}/datasets/{dataset_id}/items"
-        results_response = requests.get(results_url, headers=headers)
-        
-        if results_response.status_code != 200:
-            return False, f"Failed to get results: {results_response.text[:200]}"
-        
-        results = results_response.json()
-        
-        if not results:
-            # Try key-value store
-            store_id = status_data['data']['defaultKeyValueStoreId']
-            store_url = f"{api_base}/key-value-stores/{store_id}/records"
-            store_response = requests.get(store_url, headers=headers)
-            
-            if store_response.status_code == 200:
-                store_data = store_response.json()
-                for key, value in store_data.items():
-                    if key.endswith(('.mp4', '.webm', '.mkv')):
-                        download_url = f"{api_base}/key-value-stores/{store_id}/records/{key}"
-                        return download_file_from_url(download_url, output_filename)
-            
-            return False, "No results returned from actor"
-        
-        video_data = results[0]
-        download_url, needs_apify_auth = _find_best_video_url(video_data)
-        
-        if not download_url:
-            # Try key-value store as fallback
-            store_id = status_data['data']['defaultKeyValueStoreId']
-            store_url = f"{api_base}/key-value-stores/{store_id}/records"
-            store_response = requests.get(store_url, headers=headers)
-            
-            if store_response.status_code == 200:
-                store_data = store_response.json()
-                for key, value in store_data.items():
-                    if key.endswith(('.mp4', '.webm', '.mkv')):
-                        download_url = f"{api_base}/key-value-stores/{store_id}/records/{key}?attachment=true"
-                        needs_apify_auth = True
-                        break
-            
-            if not download_url:
-                return False, f"No download URL found. Available fields: {list(video_data.keys())}"
-        
-        auth_header = {'Authorization': f'Bearer {APIFY_API_TOKEN}'} if needs_apify_auth else None
-        return download_file_from_url(download_url, output_filename, extra_headers=auth_header)
-        
-    except Exception as e:
-        return False, f"Error: {str(e)}"
-
-def download_file_from_url(download_url, output_filename, extra_headers=None):
-    """Download a file from URL with progress tracking."""
-    try:
-        download_headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            'Accept': 'video/webm,video/ogg,video/*;q=0.9,*/*;q=0.8',
-        }
-        if extra_headers:
-            download_headers.update(extra_headers)
-        
-        file_response = requests.get(download_url, stream=True, headers=download_headers, allow_redirects=True)
-        file_response.raise_for_status()
-        
-        total_size = int(file_response.headers.get('content-length', 0))
-        
-        with open(output_filename, 'wb') as f:
-            downloaded = 0
-            for chunk in file_response.iter_content(chunk_size=8192):
-                if chunk:
-                    f.write(chunk)
-                    downloaded += len(chunk)
-        
-        return True, output_filename
-        
-    except Exception as e:
-        return False, f"Download error: {str(e)}"
-
-def download_video(youtube_url, output_filename='input_video.mp4'):
-    """Main download function."""
-    return download_video_apify(youtube_url, output_filename)
 
 # ==================== TRANSCRIPTION ====================
 
@@ -557,7 +448,7 @@ User query:
             
             # Handle rate limiting with exponential backoff
             if response.status_code == 429:
-                wait_time = min(2 ** attempt * 2, 60)  # Exponential backoff: 4, 8, 16, 32, 60
+                wait_time = min(2 ** attempt * 2, 60)
                 st.warning(f"Rate limited (429). Waiting {wait_time}s before retry {attempt}/{max_retries}...")
                 time.sleep(wait_time)
                 continue
@@ -849,11 +740,15 @@ with tab1:
             try:
                 # Create temp directory
                 with tempfile.TemporaryDirectory() as temp_dir:
-                    status_placeholder.info("📥 Downloading video...")
+                    status_placeholder.info("📥 Downloading video with pytubefix...")
                     
-                    # Download video
+                    # Download video using pytubefix
                     input_video = os.path.join(temp_dir, "input_video.mp4")
-                    success, result = download_video(video_url, input_video)
+                    success, result = download_video_pytubefix(
+                        video_url, 
+                        input_video,
+                        quality=download_quality
+                    )
                     
                     if not success:
                         st.error(f"Download failed: {result}")
@@ -861,7 +756,7 @@ with tab1:
                         st.stop()
                     
                     video_path = result
-                    status_placeholder.info("✅ Video downloaded successfully!")
+                    status_placeholder.info(f"✅ Video downloaded: {st.session_state.video_title}")
                     
                     # Transcribe
                     status_placeholder.info("🎤 Transcribing video...")

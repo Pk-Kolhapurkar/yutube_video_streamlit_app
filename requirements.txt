@@ -1,7 +1,7 @@
 openai-whisper
-streamlit==1.31.0
-requests==2.31.0
-beautifulsoup4==4.12.2
+streamlit
+requests
+beautifulsoup4
 moviepy==1.0.3
-Pillow>=10.4.0
+Pillow
 pytubefix
